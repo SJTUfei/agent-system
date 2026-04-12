@@ -1,0 +1,11 @@
+{
+    "header": {
+        "trace_id": "unique_id_001",
+        "type": "instruction",  
+        "sender": "Coordinator",
+        "callback_url": "http://localhost:9000"
+    },
+    "body": {
+        "content": "上海今天天气怎么样？"
+    }
+}
