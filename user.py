@@ -87,6 +87,10 @@ class UserClient:
             return None
 
     def run(self):
+
+        # 打印前稍微等一丢丢，让子线程的 Flask 把废话说完
+        time.sleep(0.2)
+
         print(f"=== Agent System 用户终端 已启动 ===")
         print(f"服务器: {self.server_url} | 动态监听端口: {self.port}")
         
@@ -104,6 +108,6 @@ class UserClient:
             self.send_request(payload)
 
 if __name__ == "__main__":
-    # 假设 Coordinator 运行在 8000
-    client = UserClient(server_url="http://localhost:8000")
+    # 假设 Coordinator 运行在 9000
+    client = UserClient(server_url="http://localhost:9000")
     client.run()
