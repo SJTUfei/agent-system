@@ -1,50 +1,72 @@
 import uuid
 import time
 import requests
+import socket
+import threading
+from flask import Flask, request, jsonify
 
 class UserClient:
-    """
-    UserClient 类用于模拟 Agent 系统中的用户客户端。
-    
-    主要职责：
-    1. 接收用户输入的自然语言指令。
-    2. 将指令按照规定的 JSON 格式封装为请求报文。
-    3. 通过 HTTP 协议与 Coordinator 进行通信。
-    4. 解析响应报文并将结果呈现给用户。
-    """
-
-    def __init__(self, server_url, client_port=9000):
+    def __init__(self, server_url):
+        """ 
+        初始化用户客户端，自动分配空闲端口并启动回调监听。
         """
-        初始化用户客户端。
-
-        :param server_url: Coordinator 服务的访问地址 (例如 "http://localhost:8000")
-        :param client_port: 用户客户端监听的回调端口，用于填充 callback_url
-        """
-        self.server_url = server_url
-        self.callback_url = f"http://localhost:{client_port}"
+        # coordinator的地址
+        self.server_url = server_url 
         self.sender_name = "User"
+        
+        # 1. 动态获取系统分配的空闲端口
+        self.port = self._get_free_port()
+        # 这里的 callback_url 包含了具体的路由 /callback
+        #目前传的还是localhost，无法让别的电脑上布置的coordinator访问user，等后续跑通本地就会改掉
+        self.callback_url = f"http://localhost:{self.port}/callback"
+        
+        # 2. 在后台线程启动轻量级服务器
+        self._start_callback_server()
+
+    def _get_free_port(self):
+        """利用 socket 探测操作系统当前可用的空闲端口"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # 绑定 0 端口是操作系统的“特权指令”，意味着让系统随机分配一个可用端口
+            s.bind(('', 0))
+            # 获取分配到的真实端口号
+            return s.getsockname()[1]
+
+    def _start_callback_server(self):
+        """启动后台线程运行 Flask，负责接收 Coordinator 的异步回传"""
+        app = Flask(__name__)
+
+        # 禁用 Flask 默认的控制台输出日志，让界面干净点
+        import logging
+        log = logging.getLogger('werkzeug')
+        log.setLevel(logging.ERROR)
+
+        @app.route('/callback', methods=['POST'])
+        def handle_callback():
+            # 这里接收 Coordinator 发来的 JSON
+            data = request.json
+            content = data.get("body", {}).get("content", "收到空消息")
+            trace_id = data.get("header", {}).get("trace_id", "unknown")
+            
+            print(f"\n\n[Agent 异步回传 - {trace_id}]: {content}")
+            print("[用户]: ", end="", flush=True) # 恢复输入提示符
+            return jsonify({"status": "success"}), 200
+
+        # 创建并启动后台线程
+        # t.daemon = True 保证主程序（UserClient）关闭时，这个后台监听也随之关闭
+        t = threading.Thread(target=app.run, kwargs={'port': self.port, 'debug': False, 'use_reloader': False})
+        t.daemon = True
+        t.start()
 
     def _generate_trace_id(self):
-        """
-        生成唯一的追踪 ID，用于标识单次请求链路。
-        
-        :return: 字符串格式的唯一 ID
-        """
         return f"trace_{uuid.uuid4().hex[:8]}"
 
     def pack_request(self, user_input):
-        """
-        将用户输入封装为符合项目规约的 JSON 报文。
-
-        :param user_input: 用户在命令行输入的原始字符串
-        :return: 字典格式的待发送报文
-        """
         return {
             "header": {
                 "trace_id": self._generate_trace_id(),
                 "type": "instruction",
                 "sender": self.sender_name,
-                "callback_url": self.callback_url
+                "callback_url": self.callback_url # 现在这里是动态真实的 URL
             },
             "body": {
                 "content": user_input
@@ -52,18 +74,11 @@ class UserClient:
         }
 
     def send_request(self, payload):
-        """
-        向 Coordinator 发送同步 POST 请求。
-
-        :param payload: 封装好的 JSON 报文
-        :return: 解析后的响应字典，若失败则返回 None
-        """
         try:
-            # 模拟真实发送过程
             response = requests.post(
-                f"{self.server_url}/chat", 
+                f"{self.server_url}/chat", #这里传输的是/chat接口，但是coordinator目前还是监听根路径，后续需要修改
                 json=payload, 
-                timeout=30
+                timeout=5
             )
             response.raise_for_status()
             return response.json()
@@ -71,25 +86,9 @@ class UserClient:
             print(f"[Error] 无法连接到 Coordinator: {e}")
             return None
 
-    def unpack_response(self, response_json):
-        """
-        解析 Coordinator 返回的报文，提取核心回答内容。
-
-        :param response_json: Coordinator 返回的原始 JSON 字典
-        :return: 提取出的回答文本内容
-        """
-        if not response_json:
-            return "系统繁忙，未获取到有效回复。"
-        
-        # 按照约定格式提取 body 中的 content
-        return response_json.get("body", {}).get("content", "解析失败：响应内容为空")
-
     def run(self):
-        """
-        启动客户端交互主循环。
-        """
         print(f"=== Agent System 用户终端 已启动 ===")
-        print(f"服务器地址: {self.server_url} | 回调地址: {self.callback_url}")
+        print(f"服务器: {self.server_url} | 动态监听端口: {self.port}")
         
         while True:
             user_input = input("\n[用户]: ").strip()
@@ -98,18 +97,13 @@ class UserClient:
             if not user_input:
                 continue
 
-            # 1. 封装
             payload = self.pack_request(user_input)
+            print(f"指令已发出 (trace_id: {payload['header']['trace_id']})... 等待异步回复")
             
-            # 2. 发送并获取响应
-            print(f"系统处理中 (trace_id: {payload['header']['trace_id']})...")
-            raw_response = self.send_request(payload)
-            
-            # 3. 解析与展示
-            answer = self.unpack_response(raw_response)
-            print(f"[Agent]: {answer}")
+            # 发送请求（Coordinator 应该立刻返回一个“已收到”的确认）
+            self.send_request(payload)
 
 if __name__ == "__main__":
-    # 示例启动逻辑
+    # 假设 Coordinator 运行在 8000
     client = UserClient(server_url="http://localhost:8000")
     client.run()
