@@ -1,11 +1,13 @@
 from BaseAgent import BaseAgent
 from llm_client import ask_llm
 from prompts import ROUTING_PROMPT_TEMPLATE
+import argparse
 
 class Coordinator(BaseAgent):
-    def __init__(self, name, port):
+    def __init__(self, name, port,api_key):
         super().__init__(name, port)
         # 记录待处理任务：{trace_id: user_callback_url}
+        self.api_key = api_key
         self.pending_tasks = {}
         # 子 Agent 注册表
         self.agent_registry = {
@@ -68,7 +70,7 @@ class Coordinator(BaseAgent):
         )
         
         # 0.0 的 temperature 保证决策稳定性
-        raw_result = ask_llm(system_prompt, "请输出匹配的 Agent 名称：", 0.0)
+        raw_result = ask_llm(system_prompt, "请输出匹配的 Agent 名称：", self.api_key, 0.0)
         result = raw_result.strip().lower()
         
         if result == "none":
@@ -104,6 +106,15 @@ class Coordinator(BaseAgent):
             print(f"⚠️ 收到孤儿答案 {trace_id}，找不到对应的用户信息。")
 
 if __name__ == "__main__":
-    # 启动指挥官
-    coord = Coordinator("Coordinator", 9000)
+    parser = argparse.ArgumentParser(description="运行含有 API 调用的脚本")
+    parser.add_argument(
+        "--api_key", 
+        "-k", 
+        type=str, 
+        required=True, 
+        help="请在此输入您的 API Key"
+    )
+    args = parser.parse_args()
+    api_key = args.api_key
+    coord = Coordinator("Coordinator", 9000, api_key)
     coord.start()
