@@ -15,49 +15,42 @@ class Coordinator(BaseAgent):
         }
 
     def handle_task(self, data):
-        header = data.get("header", {})
-        msg_type = header.get("type")
-        trace_id = header.get("trace_id")
-        content = data.get("body", {}).get("content", "")
+        # 【修改点】：直接解析扁平化字段
+        source = data.get("source")
+        task_id = data.get("task_id")
+        instruction = data.get("instruction", "")
 
-        if msg_type == "instruction":
-            # 1. 记账：把用户的地址存起来
-            user_url = header.get("callback_url")
-            self.pending_tasks[trace_id] = user_url
-            print(f"[*] 任务 {trace_id} 已登记，来源: {user_url}")
+        # 判断是派发新任务，还是接收结果
+        if source == "user":
+            user_url = data.get("callback_url")
+            self.pending_tasks[task_id] = user_url
+            print(f"[*] 任务 {task_id} 已登记，来源: {user_url}")
             
-            # 2. 路由决策：问 LLM 这个任务该给哪个 Agent
             try:
-                target_agent_name = self.call_llm_for_routing(content) 
+                target_agent_name = self.call_llm_for_routing(instruction) 
             except ValueError as e:
                 print(f"❌ 路由决策出错: {e}")
-                return # 或者发回一个错误给用户
+                return 
 
             target_port = self.agent_registry.get(target_agent_name)
 
             if target_port:
-                # 3. 规范化并封装 Payload
+                # 【修改点】：使用扁平化的 A2A 格式转发给下级 Agent
                 dispatch_payload = {
-                    "header": {
-                        "trace_id": trace_id,
-                        "type": "instruction",
-                        "sender": self.name,
-                        "callback_url": f"http://localhost:{self.port}" 
-                    },
-                    "body": {
-                        "content": content
-                    }
+                    "source": self.name,
+                    "target": target_agent_name,
+                    "task_id": task_id,
+                    "instruction": instruction,
+                    "callback_url": f"http://localhost:{self.port}" 
                 }
 
-                # 4. 执行转发
-                print(f"[*] 指挥官决策：任务 {trace_id} 转发至 {target_agent_name} (Port: {target_port})")
+                print(f"[*] 指挥官决策：任务 {task_id} 转发至 {target_agent_name} (Port: {target_port})")
                 self.send_to(target_port, dispatch_payload)
             else:
                 print(f"⚠️ 决策失败：无法匹配到合适的 Agent。")
 
-        elif msg_type == "answer":
-            # 收到下级 Agent 办完事回来的结果
-            print(f"[*] 收到来自 {header.get('sender')} 的执行结果，准备回传给用户...")
+        elif source in self.agent_registry:
+            print(f"[*] 收到来自 {source} 的执行结果，准备回传给用户...")
             self.finalize_response(data)
 
     def call_llm_for_routing(self, instruction):
@@ -82,28 +75,28 @@ class Coordinator(BaseAgent):
         raise ValueError(f"LLM 路由异常！非法返回值: '{raw_result}'")
 
     def finalize_response(self, data):
-        trace_id = data.get("header", {}).get("trace_id")
-        user_url = self.pending_tasks.get(trace_id)
+        task_id = data.get("task_id")
+        user_url = self.pending_tasks.get(task_id)
         
         if user_url:
             final_payload = {
-                "header": {
-                    "trace_id": trace_id,
-                    "type": "answer",
-                    "sender": self.name
-                },
-                "body": {
-                    "content": data.get("body", {}).get("content")
-                }
+                "source": self.name,
+                "target": "user",
+                "task_id": task_id,
+                "instruction": data.get("instruction")
             }
-            # 任务完成，清理记录
-            del self.pending_tasks[trace_id]
+            del self.pending_tasks[task_id]
+            print(f"[*] 任务 {task_id} 处理完毕，正在回传...")
             
-            # 使用统一的 send_to，确保日志被记录
-            print(f"[*] 任务 {trace_id} 处理完毕，正在回传...")
-            self.send_to(user_url, final_payload)
+            # 由于 UserClient 目前是用 Flask @app.route('/callback')，所以要确保提取正确的端口后补全 /callback
+            # 但我们在 user.py 里传过来的 callback_url 已经是完整的了
+            import requests
+            try:
+                requests.post(user_url, json=final_payload, timeout=5)
+            except Exception as e:
+                print(f"❌ 回传给用户失败: {e}")
         else:
-            print(f"⚠️ 收到孤儿答案 {trace_id}，找不到对应的用户信息。")
+            print(f"⚠️ 收到孤儿答案 {task_id}，找不到对应的用户信息。")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="运行含有 API 调用的脚本")
