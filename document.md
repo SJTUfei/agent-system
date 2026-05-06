@@ -1,34 +1,39 @@
-# 多智能体系统 (Multi-Agent System) 架构说明
+# Multi-Agent 系统项目开发文档
 
-本系统基于 **A2A (Agent-to-Agent)** 异步通信模式构建，由底层基类、中枢调度器和功能模块组成。
+本项目实现了一个基于 **异步回调机制** 的轻量级多智能体协同系统。通过将复杂的任务逻辑（如天气查询、大模型推理）拆分到不同的 Agent 中，实现了任务的解耦与自动化调度[cite: 1, 2, 6]。
+
+---
+
+## 1. 整体架构与文件作用
+
+项目采用中心化调度架构，由 `Coordinator` 负责路由分发，各功能 `Agent` 负责具体业务执行。
+
+| 文件名 | 核心作用 | 技术选型 |
+| :--- | :--- | :--- |
+| **`BaseAgent.py`** | **抽象基类**：封装了所有 Agent 通用的网络监听、日志记录和消息发送逻辑。它是整个系统的通信基石。 | `http.server`, `requests` |
+| **`coordinator.py`** | **任务调度员**：负责登记用户任务，利用 LLM 决定将任务分配给哪个子 Agent，并处理结果回传。 | `BaseAgent`, `llm_client` |
+| **`user.py`** | **交互终端**：用户输入指令的入口，并在后台启动轻量级服务器接收异步结果回传[cite: 5]。 | `Flask`, `threading`, `socket` |
+| **`weather_agent.py`** | **业务执行者**：负责参数提取（LLM）、工具调用（MCP）以及最终回答的拟人化包装[cite: 6]。 | `BaseAgent`, `llm_client` |
+| **`weather_mcp.py`** | **工具服务端**：严格遵循 JSON-RPC 2.0 协议，模拟真实的天气数据库或 API 接口[cite: 7]。 | `JSON-RPC 2.0`, `http.server` |
+| **`llm_client.py`** | **AI 适配器**：统一封装了大模型调用接口，支持 DeepSeek 等多种 API 以后端调用[cite: 3]。 | `openai SDK` |
+| **`prompts.py`** | **提示词库**：集中管理路由决策、参数提取等所有环节的 System Prompt[cite: 4]。 | Python 字符串 |
 
 ---
 
-## 1. 核心组件分析
+## 2. 核心技术实现
 
-### 🧱 BaseAgent (模板基类)
-`BaseAgent` 是系统的骨架，统一了所有 Agent 的底层通信协议。
-*   **核心功能**：
-    *   使用 `http.server` 搭建基础服务器，负责端口监听与消息接收。
-    *   封装了通用功能：网络通信逻辑、日志记录 (`log`) 以及消息发送 (`send_to`)。
-    *   **异步机制**：采用“先回执、后处理”的策略，定义了 `handle_task` 接口供子类重写。
-*   **待改进方案**：
-    *   **多线程升级**：目前 `do_POST` 逻辑中调用 `handle_task` 存在阻塞风险，需引入多线程处理业务，确保能立即向客户端返回 200 OK 并刷新缓冲区。
-    *   **解开硬编码**：目前通信地址硬编码为 `localhost`，后续需支持根据动态 IP 和自定义 Path 进行跨机通信。
+### 2.1 服务器搭建技术
+*   **低量级 Agent 服务 (`http.server`)**: 使用 Python 原生的 `HTTPServer` 搭建。它监听特定端口并重写 `do_POST` 方法，直接解析二进制字节流为 JSON 数据，适合作为轻量级智能体的节点[cite: 1, 7]。
+*   **动态回调服务 (`Flask`)**: 在 `UserClient` 中集成 Flask。利用其路由装饰器（如 `@app.route('/callback')`）快速处理异步结果，并结合 `socket` 自动探测空闲端口，避免端口冲突[cite: 5]。
 
-### 🧠 Coordinator (调度中枢)
-`Coordinator` 继承自 `BaseAgent`，是整个系统的“大脑”，负责逻辑路由与任务追踪。
-*   **核心功能**：
-    *   **路由分发**：根据用户输入，决策并将任务转发给具体的子 Agent。
-    *   **状态管理**：维护一个**任务列表 (Pending Tasks)** 记录提问者信息（如回调地址），确保子 Agent 返回结果后能精准投递给正确的客户端。
-    *   **逻辑路由**：通过 `msg_type` 区分消息来源（User 或 Sub-Agent），执行不同的处理分支。
-*   **待改进方案**：
-    *   **协议对齐**：目前的 Payload 格式需进一步适配实验要求。例如，确保发送至工作 Agent 的请求指向 `/execute_task` 接口。
-    *   **接口标准化**：本地跑通后，需将固定端口改为支持 IP/Path 动态寻址的模式。
+### 2.2 通信标准 (A2A 扁平化报文)
+系统内部（Agent-to-Agent）采用统一的 **JSON 扁平化报文** 格式，确保跨节点通信的标准化[cite: 1, 2, 5, 6]：
 
-### 🤖 LLM_Client (智能工具模块)
-负责与大模型（如 DeepSeek、GPT）交互的工具类。
-*   **核心功能**：
-    *   兼容 OpenAI 库规范，支持多模型调用。
-
----
+```json
+{
+    "source": "发送方标识 (如 user, coordinator, weather_agent)",
+    "target": "接收方标识",
+    "task_id": "任务唯一标识 (用于异步追踪结果)",
+    "instruction": "具体指令内容或执行结果",
+    "callback_url": "后续结果回传的 HTTP 地址"
+}
