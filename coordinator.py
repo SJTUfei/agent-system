@@ -11,7 +11,8 @@ class Coordinator(BaseAgent):
         self.pending_tasks = {}
         # 子 Agent 注册表
         self.agent_registry = {
-            "weather_agent": 9010
+            "weather_agent": 9010,
+            "tour_agent": 9020
         }
 
     def handle_task(self, data):
