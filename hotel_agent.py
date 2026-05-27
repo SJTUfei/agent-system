@@ -89,8 +89,8 @@ class HotelAgent(BaseAgent):
         }
 
         print("[*] HotelAgent 处理完毕，准备回传至 Coordinator...")
-        coord_port = int(callback_url.split(":")[-1].replace("/", ""))
-        self.send_to(coord_port, return_payload)
+        # callback_url 是 Coordinator 的真实网络可达地址，直接利用 BaseAgent 的 send_to 即可
+        self.send_to(callback_url, return_payload)
 
     def extract_areas(self, tour_structured_data):
         areas = []

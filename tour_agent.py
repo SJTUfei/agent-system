@@ -82,9 +82,8 @@ class TourAgent(BaseAgent):
             return_payload["structured_data"] = structured_data
         
         print(f"[*] TourAgent 处理完毕，准备回传至 Coordinator...")
-        # 提取目标端口并使用 BaseAgent 原生的 send_to 发送
-        coord_port = int(callback_url.split(":")[-1].replace("/", ""))
-        self.send_to(coord_port, return_payload)
+        # callback_url 是 Coordinator 的真实网络可达地址，直接利用 BaseAgent 的 send_to 即可
+        self.send_to(callback_url, return_payload)
 
     def build_structured_data(self, city, instruction, attractions_data):
         areas = []
