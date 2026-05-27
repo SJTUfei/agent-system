@@ -3,27 +3,13 @@ from llm_client import ask_llm
 from prompts import ROUTING_PROMPT_TEMPLATE
 import argparse
 import requests
-import socket
-
-
-def get_lan_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
 
 
 class Coordinator(BaseAgent):
     def __init__(self, name, port, api_key, weather_agent_host, tour_agent_host, hotel_agent_host):
         super().__init__(name, port)
-        # 记录待处理任务：{trace_id: user_callback_url}
         self.api_key = api_key
-        self.lan_ip = getattr(self, "lan_ip", get_lan_ip())
+        # 记录待处理任务：{trace_id: user_callback_url}
         self.pending_tasks = {}
         # 串行任务状态：用于记录 tour_agent -> hotel_agent 的网络依赖
         self.pipeline_tasks = {}
@@ -35,18 +21,17 @@ class Coordinator(BaseAgent):
         }
 
     def handle_task(self, data):
-        # 【修改点】：直接解析扁平化字段
         source = data.get("source")
         task_id = data.get("task_id")
         instruction = data.get("instruction", "")
 
-        # 判断是派发新任务，还是接收结果
+        # 判断是派发新任务，还是接收子 Agent 算好的结果
         if source == "user":
             user_url = data.get("callback_url")
             self.pending_tasks[task_id] = user_url
-            print(f"[*] 任务 {task_id} 已登记，来源: {user_url}")
+            print(f"[*] 新任务 {task_id} 已登记，客户端回调来源: {user_url}")
 
-            # 新增：如果用户同时提出行程/景点 + 酒店需求，启动串行网络流程
+            # 如果用户同时提出行程/景点 + 酒店需求，启动串行网络流程
             if self.should_run_tour_then_hotel(instruction):
                 print(f"[*] 任务 {task_id} 命中旅行 + 酒店复合请求，先派发给 tour_agent")
                 self.pipeline_tasks[task_id] = {
@@ -58,18 +43,17 @@ class Coordinator(BaseAgent):
                 }
                 self.dispatch_to_agent(task_id, "tour_agent", instruction)
                 return
-            
+
             try:
-                target_agent_name = self.call_llm_for_routing(instruction) 
+                target_agent_name = self.call_llm_for_routing(instruction)
             except ValueError as e:
                 print(f"路由决策出错: {e}")
                 self.reply_unsupported_task(task_id, user_url, instruction)
-                return 
+                return
 
             target_host = self.agent_registry.get(target_agent_name)
 
             if target_host:
-                # 使用自身的局域网真实 IP 组合成 callback_url，让远程机器能准确找到我
                 dispatch_payload = {
                     "source": self.name,
                     "target": target_agent_name,
@@ -79,43 +63,42 @@ class Coordinator(BaseAgent):
                 }
 
                 print(f"[*] 指挥官决策：任务 {task_id} 转发至 {target_agent_name} ({target_host})")
-                self.send_to_agent_host(target_host, dispatch_payload)
+                self.send_to(target_host, dispatch_payload)
             else:
-                print("[!] 决策失败：无法匹配到合适的 Agent。")
+                print(f"[!] 决策失败：路由指派了 '{target_agent_name}'，但注册表中未配置其 IP 终点。")
                 self.reply_unsupported_task(task_id, user_url, instruction)
 
         elif source in self.agent_registry:
             if task_id in self.pipeline_tasks:
                 self.handle_pipeline_result(data)
             else:
-                print(f"[*] 收到来自 {source} 的执行结果，准备回传给用户...")
+                print(f"[*] 收到子智能体 {source} 传回的执行结果，准备将其跨网络返还给用户客户端...")
                 self.finalize_response(data)
 
     def call_llm_for_routing(self, instruction):
         valid_agents = list(self.agent_registry.keys())
         agents_str = ", ".join(valid_agents)
-        
+
         system_prompt = ROUTING_PROMPT_TEMPLATE.format(
             agent_list=agents_str,
             instruction=instruction
         )
-        
-        # 0.0 的 temperature 保证决策稳定性
+
         raw_result = ask_llm(system_prompt, "请输出匹配的 Agent 名称：", self.api_key, 0.0)
         result = raw_result.strip().lower()
-        
+
         if result == "none":
             return "none"
-        
+
         if result in valid_agents:
             return result
-        
+
         raise ValueError(f"LLM 路由异常！非法返回值: '{raw_result}'")
 
     def finalize_response(self, data):
         task_id = data.get("task_id")
         user_url = self.pending_tasks.get(task_id)
-        
+
         if user_url:
             final_payload = {
                 "source": self.name,
@@ -126,17 +109,18 @@ class Coordinator(BaseAgent):
             if "structured_data" in data:
                 final_payload["structured_data"] = data.get("structured_data")
 
+            # 清理内存中的任务追踪
             del self.pending_tasks[task_id]
-            print(f"[*] 任务 {task_id} 处理完毕，正在回传...")
-            
-            # 由于 UserClient 目前是用 Flask @app.route('/callback')，所以要确保提取正确的端口后补全 /callback
-            # 但我们在 user.py 里传过来的 callback_url 已经是完整的了
+            print(f"[*] 任务 {task_id} 处理完毕，开始向外网发起 HTTP POST 异步回调...")
+
             try:
-                requests.post(user_url, json=final_payload, timeout=5)
+                response = requests.post(user_url, json=final_payload, timeout=5)
+                if response.status_code == 200:
+                    print("✅ 最终旅游方案已成功送回用户端！")
             except Exception as e:
-                print(f"回传给用户失败: {e}")
+                print(f"❌ 异步回传给用户端 {user_url} 发生异常: {e}")
         else:
-            print(f"[!] 收到孤儿答案 {task_id}，找不到对应的用户信息。")
+            print(f"⚠️ 收到孤儿答案 {task_id}，在 pending_tasks 中找不到对应的回调客户端。")
 
     def should_run_tour_then_hotel(self, instruction):
         tour_keywords = ["景点", "行程", "旅游", "旅行", "游玩", "路线", "几日游", "一日游", "两日游", "三日游"]
@@ -147,25 +131,6 @@ class Coordinator(BaseAgent):
 
     def coordinator_callback_url(self):
         return f"http://{self.lan_ip}:{self.port}"
-
-    def normalize_agent_host(self, target_host):
-        if isinstance(target_host, int) or str(target_host).isdigit():
-            return f"http://localhost:{target_host}"
-        if str(target_host).startswith("http://") or str(target_host).startswith("https://"):
-            return str(target_host)
-        return f"http://{target_host}"
-
-    def send_to_agent_host(self, target_host, payload):
-        url = self.normalize_agent_host(target_host)
-        self.log("SEND", payload)
-        try:
-            response = requests.post(url, json=payload, timeout=5)
-            if response.status_code == 200:
-                print(f"✅ 消息已成功送达至 {url}")
-            else:
-                print(f"⚠️ 消息送达至 {url}，但对方返回状态码: {response.status_code}")
-        except Exception as e:
-            print(f"❌ 无法连接到远程地址 {url}: {e}")
 
     def dispatch_to_agent(self, task_id, target_agent_name, instruction, context=None):
         target_host = self.agent_registry.get(target_agent_name)
@@ -184,7 +149,7 @@ class Coordinator(BaseAgent):
             dispatch_payload["context"] = context
 
         print(f"[*] Coordinator 派发任务 {task_id} -> {target_agent_name} ({target_host})")
-        self.send_to_agent_host(target_host, dispatch_payload)
+        self.send_to(target_host, dispatch_payload)
 
     def handle_pipeline_result(self, data):
         task_id = data.get("task_id")
@@ -276,15 +241,10 @@ class Coordinator(BaseAgent):
         except Exception as e:
             print(f"回传给用户失败: {e}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Coordinator 局域网启动脚本")
-    parser.add_argument(
-        "--api_key", 
-        "-k", 
-        type=str, 
-        required=True, 
-        help="请在此输入您的 API Key"
-    )
+    parser.add_argument("--api_key", "-k", type=str, required=True, help="LLM API Key")
     parser.add_argument("--port", "-p", type=int, default=9000, help="本节点监听端口 (默认9000)")
     parser.add_argument("--weather_agent_host", "-w", type=str, default="localhost:9010", help="天气智能体的网络地址 (例如 192.168.1.101:9010)")
     parser.add_argument("--tour_agent_host", "-t", type=str, default="localhost:9020", help="景点/行程智能体的网络地址 (例如 192.168.1.102:9020)")

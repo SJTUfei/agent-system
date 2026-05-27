@@ -1,19 +1,17 @@
 # weather_mcp.py
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+from BaseAgent import get_lan_ip  # 引入 IP 探测
 
 class WeatherMcp:
     def __init__(self, name, port):
         self.name = name
         self.port = port
+        self.lan_ip = get_lan_ip()
 
     def handle_task(self, data):
-        """
-        纯粹的工具执行逻辑：校验 JSON-RPC 2.0 规范并返回结果
-        """
         req_id = data.get("id", None)
         
-        # 1. 严格校验请求规范
         if data.get("jsonrpc") != "2.0" or "method" not in data:
             return {
                 "jsonrpc": "2.0",
@@ -24,22 +22,19 @@ class WeatherMcp:
         method = data.get("method")
         params = data.get("params", {})
         
-        # 2. 路由到具体的工具函数
         if method == "get_weather":
             city = params.get("city", "未知")
-            print(f"[*] 收到查询请求：正在查询 {city} 的天气...")
+            print(f"[*] 收到 JSON-RPC 2.0 请求：正在查询 {city} 的天气...")
             
-            # 💡 这里写死模拟数据，真实业务中这里会使用 requests 调用高德天气等 API
+            # 💡 模拟天气数据
             mock_result = {"temp": "15°C", "condition": "晴"}
             
-            # 3. 构造标准的 JSON-RPC 响应
             return {
                 "jsonrpc": "2.0",
                 "result": mock_result,
                 "id": req_id
             }
         else:
-            # 找不到对应的方法
             return {
                 "jsonrpc": "2.0",
                 "error": {"code": -32601, "message": f"Method '{method}' not found"},
@@ -47,10 +42,14 @@ class WeatherMcp:
             }
 
     def start(self):
-        server_address = ('', self.port)
+        # 绑定 '0.0.0.0' 使其可以被局域网内的任何 Agent 访问
+        server_address = ('0.0.0.0', self.port)
         weather_mcp = self
         
         class WeatherMcpHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass # 屏蔽底层输出
+
             def do_POST(self):
                 try:
                     content_length = int(self.headers['Content-Length'])
@@ -59,17 +58,14 @@ class WeatherMcp:
                     
                     weather_mcp.log("RECEIVE", data)
                     
-                    # 💡 调用 handle_task，拿到真正的结果字典
+                    # 💡 获取响应体
                     response_body = weather_mcp.handle_task(data)
                     
-                    # 开始发送同步响应
                     self.send_response(200)
                     self.send_header('Content-type', 'application/json')
                     self.end_headers()
                     
-                    # 💡 把结果打包当场发送回去
                     self.wfile.write(json.dumps(response_body, ensure_ascii=False).encode('utf-8'))
-                    
                     weather_mcp.log("SEND", response_body)
                     
                 except Exception as e:
@@ -77,20 +73,27 @@ class WeatherMcp:
                     
         httpd = HTTPServer(server_address, WeatherMcpHandler)
 
-        print(f"✅ {self.name} 启动成功，作为独立工具服务正在端口 {self.port} 待命...")
+        print(f"✅ {self.name} 工具服务端已开启！")
+        print(f"   📍 局域网访问地址: http://{self.lan_ip}:{self.port}")
+        
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print(f"\n🛑 {self.name} 正在关闭...")
+        finally:
             httpd.server_close()
 
     def log(self, direction, message):
-        print(f"\n{'='*20} [{self.name}] {'='*20}")
+        print(f"\n{'='*20} [{self.name} @ {self.lan_ip}] {'='*20}")
         print(f"方向: {direction}")
         print(f"内容: {json.dumps(message, indent=4, ensure_ascii=False)}")
         print(f"{'='*50}")
 
 if __name__ == "__main__":
-    # 监听 8001 端口
-    mcp = WeatherMcp("weather_mcp", 8001)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", "-p", type=int, default=8001, help="本节点监听端口 (默认8001)")
+    args = parser.parse_args()
+
+    mcp = WeatherMcp("weather_mcp", args.port)
     mcp.start()
