@@ -1,18 +1,23 @@
-from BaseAgent import BaseAgent, get_lan_ip
+from BaseAgent import BaseAgent
 from llm_client import ask_llm
 from prompts import ROUTING_PROMPT_TEMPLATE
 import argparse
+import requests
+
 
 class Coordinator(BaseAgent):
-    def __init__(self, name, port, api_key, weather_agent_host):
+    def __init__(self, name, port, api_key, weather_agent_host, tour_agent_host, hotel_agent_host):
         super().__init__(name, port)
         self.api_key = api_key
-        # 记录待处理任务：{task_id: user_callback_url}
+        # 记录待处理任务：{trace_id: user_callback_url}
         self.pending_tasks = {}
-        
+        # 串行任务状态：用于记录 tour_agent -> hotel_agent 的网络依赖
+        self.pipeline_tasks = {}
         # 局域网子 Agent 注册表，支持在命令行动态传入其他设备上的 Agent IP 及端口
         self.agent_registry = {
-            "weather_agent": weather_agent_host  # 例如 "192.168.1.101:9010" 或 "localhost:9010"
+            "weather_agent": weather_agent_host,
+            "tour_agent": tour_agent_host,
+            "hotel_agent": hotel_agent_host
         }
 
     def handle_task(self, data):
@@ -25,58 +30,75 @@ class Coordinator(BaseAgent):
             user_url = data.get("callback_url")
             self.pending_tasks[task_id] = user_url
             print(f"[*] 新任务 {task_id} 已登记，客户端回调来源: {user_url}")
-            
+
+            # 如果用户同时提出行程/景点 + 酒店需求，启动串行网络流程
+            if self.should_run_tour_then_hotel(instruction):
+                print(f"[*] 任务 {task_id} 命中旅行 + 酒店复合请求，先派发给 tour_agent")
+                self.pipeline_tasks[task_id] = {
+                    "user_url": user_url,
+                    "original_instruction": instruction,
+                    "stage": "waiting_tour",
+                    "tour_result": None,
+                    "hotel_result": None
+                }
+                self.dispatch_to_agent(task_id, "tour_agent", instruction)
+                return
+
             try:
-                target_agent_name = self.call_llm_for_routing(instruction) 
+                target_agent_name = self.call_llm_for_routing(instruction)
             except ValueError as e:
-                print(f"❌ 路由决策出错: {e}")
-                return 
+                print(f"路由决策出错: {e}")
+                self.reply_unsupported_task(task_id, user_url, instruction)
+                return
 
             target_host = self.agent_registry.get(target_agent_name)
 
             if target_host:
-                # 使用自身的局域网真实 IP 组合成 callback_url，让远程机器能准确找到我
                 dispatch_payload = {
                     "source": self.name,
                     "target": target_agent_name,
                     "task_id": task_id,
                     "instruction": instruction,
-                    "callback_url": f"http://{self.lan_ip}:{self.port}" 
+                    "callback_url": self.coordinator_callback_url()
                 }
 
                 print(f"[*] 指挥官决策：任务 {task_id} 转发至 {target_agent_name} ({target_host})")
                 self.send_to(target_host, dispatch_payload)
             else:
-                print(f"⚠️ 决策失败：路由指派了 '{target_agent_name}'，但注册表中未配置其 IP 终点。")
+                print(f"[!] 决策失败：路由指派了 '{target_agent_name}'，但注册表中未配置其 IP 终点。")
+                self.reply_unsupported_task(task_id, user_url, instruction)
 
         elif source in self.agent_registry:
-            print(f"[*] 收到子智能体 {source} 传回的执行结果，准备将其跨网络返还给用户客户端...")
-            self.finalize_response(data)
+            if task_id in self.pipeline_tasks:
+                self.handle_pipeline_result(data)
+            else:
+                print(f"[*] 收到子智能体 {source} 传回的执行结果，准备将其跨网络返还给用户客户端...")
+                self.finalize_response(data)
 
     def call_llm_for_routing(self, instruction):
         valid_agents = list(self.agent_registry.keys())
         agents_str = ", ".join(valid_agents)
-        
+
         system_prompt = ROUTING_PROMPT_TEMPLATE.format(
             agent_list=agents_str,
             instruction=instruction
         )
-        
+
         raw_result = ask_llm(system_prompt, "请输出匹配的 Agent 名称：", self.api_key, 0.0)
         result = raw_result.strip().lower()
-        
+
         if result == "none":
             return "none"
-        
+
         if result in valid_agents:
             return result
-        
+
         raise ValueError(f"LLM 路由异常！非法返回值: '{raw_result}'")
 
     def finalize_response(self, data):
         task_id = data.get("task_id")
         user_url = self.pending_tasks.get(task_id)
-        
+
         if user_url:
             final_payload = {
                 "source": self.name,
@@ -84,27 +106,157 @@ class Coordinator(BaseAgent):
                 "task_id": task_id,
                 "instruction": data.get("instruction")
             }
+            if "structured_data" in data:
+                final_payload["structured_data"] = data.get("structured_data")
+
             # 清理内存中的任务追踪
             del self.pending_tasks[task_id]
             print(f"[*] 任务 {task_id} 处理完毕，开始向外网发起 HTTP POST 异步回调...")
-            
-            import requests
+
             try:
-                # 此时的 user_url 是客户端所在的真实 IP，例如 http://192.168.1.102:53421/callback
                 response = requests.post(user_url, json=final_payload, timeout=5)
                 if response.status_code == 200:
-                    print(f"✅ 最终旅游方案已成功送回用户端！")
+                    print("✅ 最终旅游方案已成功送回用户端！")
             except Exception as e:
                 print(f"❌ 异步回传给用户端 {user_url} 发生异常: {e}")
         else:
             print(f"⚠️ 收到孤儿答案 {task_id}，在 pending_tasks 中找不到对应的回调客户端。")
+
+    def should_run_tour_then_hotel(self, instruction):
+        tour_keywords = ["景点", "行程", "旅游", "旅行", "游玩", "路线", "几日游", "一日游", "两日游", "三日游"]
+        hotel_keywords = ["酒店", "住宿", "住哪", "住哪里", "宾馆", "民宿", "订房"]
+        has_tour_intent = any(keyword in instruction for keyword in tour_keywords)
+        has_hotel_intent = any(keyword in instruction for keyword in hotel_keywords)
+        return has_tour_intent and has_hotel_intent
+
+    def coordinator_callback_url(self):
+        return f"http://{self.lan_ip}:{self.port}"
+
+    def dispatch_to_agent(self, task_id, target_agent_name, instruction, context=None):
+        target_host = self.agent_registry.get(target_agent_name)
+        if not target_host:
+            print(f"[!] 决策失败：无法匹配到合适的 Agent: {target_agent_name}")
+            return
+
+        dispatch_payload = {
+            "source": self.name,
+            "target": target_agent_name,
+            "task_id": task_id,
+            "instruction": instruction,
+            "callback_url": self.coordinator_callback_url()
+        }
+        if context is not None:
+            dispatch_payload["context"] = context
+
+        print(f"[*] Coordinator 派发任务 {task_id} -> {target_agent_name} ({target_host})")
+        self.send_to(target_host, dispatch_payload)
+
+    def handle_pipeline_result(self, data):
+        task_id = data.get("task_id")
+        source = data.get("source")
+        pipeline = self.pipeline_tasks[task_id]
+
+        if source == "tour_agent" and pipeline["stage"] == "waiting_tour":
+            print(f"[*] 任务 {task_id}: 已收到 tour_agent 网络回调，依赖条件满足")
+            pipeline["tour_result"] = data
+            pipeline["stage"] = "waiting_hotel"
+
+            context = {
+                "dependency": "tour_agent",
+                "tour_result_text": data.get("instruction", ""),
+                "tour_structured_data": data.get("structured_data", {})
+            }
+            print(f"[*] 任务 {task_id}: 正在通过网络唤醒 hotel_agent")
+            self.dispatch_to_agent(
+                task_id,
+                "hotel_agent",
+                pipeline["original_instruction"],
+                context=context
+            )
+            return
+
+        if source == "hotel_agent" and pipeline["stage"] == "waiting_hotel":
+            print(f"[*] 任务 {task_id}: 已收到 hotel_agent 网络回调，准备汇总最终结果")
+            pipeline["hotel_result"] = data
+            self.finalize_pipeline_response(task_id)
+            return
+
+        print(f"[!] 任务 {task_id}: 收到不符合当前阶段的回调 source={source}, stage={pipeline['stage']}")
+
+    def finalize_pipeline_response(self, task_id):
+        pipeline = self.pipeline_tasks.get(task_id)
+        if not pipeline:
+            print(f"[!] 找不到串行任务状态: {task_id}")
+            return
+
+        tour_text = pipeline["tour_result"].get("instruction", "") if pipeline["tour_result"] else ""
+        hotel_text = pipeline["hotel_result"].get("instruction", "") if pipeline["hotel_result"] else ""
+        final_answer = (
+            "【行程规划】\n"
+            f"{tour_text}\n\n"
+            "【酒店推荐】\n"
+            f"{hotel_text}"
+        )
+
+        final_payload = {
+            "source": self.name,
+            "target": "user",
+            "task_id": task_id,
+            "instruction": final_answer,
+            "structured_data": {
+                "tour": pipeline["tour_result"].get("structured_data", {}) if pipeline["tour_result"] else {},
+                "hotel": pipeline["hotel_result"].get("structured_data", {}) if pipeline["hotel_result"] else {}
+            }
+        }
+
+        user_url = pipeline["user_url"]
+        del self.pipeline_tasks[task_id]
+        if task_id in self.pending_tasks:
+            del self.pending_tasks[task_id]
+
+        print(f"[*] 串行任务 {task_id} 已完成，正在回传给用户...")
+        try:
+            requests.post(user_url, json=final_payload, timeout=5)
+        except Exception as e:
+            print(f"回传给用户失败: {e}")
+
+    def reply_unsupported_task(self, task_id, user_url, instruction):
+        final_payload = {
+            "source": self.name,
+            "target": "user",
+            "task_id": task_id,
+            "instruction": (
+                "当前系统主要支持旅行相关任务，例如天气查询、景点推荐、行程规划、酒店/住宿推荐。"
+                f"\n您刚才的问题是：{instruction}\n"
+                "可以换成类似“帮我规划上海两日游并推荐酒店”的问题来体验多 Agent 协同链路。"
+            )
+        }
+
+        if task_id in self.pending_tasks:
+            del self.pending_tasks[task_id]
+
+        print(f"[*] 任务 {task_id} 不属于当前 Agent 能力范围，已回传提示给用户。")
+        try:
+            requests.post(user_url, json=final_payload, timeout=5)
+        except Exception as e:
+            print(f"回传给用户失败: {e}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Coordinator 局域网启动脚本")
     parser.add_argument("--api_key", "-k", type=str, required=True, help="LLM API Key")
     parser.add_argument("--port", "-p", type=int, default=9000, help="本节点监听端口 (默认9000)")
     parser.add_argument("--weather_agent_host", "-w", type=str, default="localhost:9010", help="天气智能体的网络地址 (例如 192.168.1.101:9010)")
+    parser.add_argument("--tour_agent_host", "-t", type=str, default="localhost:9020", help="景点/行程智能体的网络地址 (例如 192.168.1.102:9020)")
+    parser.add_argument("--hotel_agent_host", "-o", type=str, default="localhost:9030", help="酒店智能体的网络地址 (例如 192.168.1.103:9030)")
     args = parser.parse_args()
-    
-    coord = Coordinator("Coordinator", args.port, args.api_key, args.weather_agent_host)
+
+    coord = Coordinator(
+        "Coordinator",
+        args.port,
+        args.api_key,
+        args.weather_agent_host,
+        args.tour_agent_host,
+        args.hotel_agent_host
+    )
     coord.start()
