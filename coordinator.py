@@ -3,20 +3,35 @@ from llm_client import ask_llm
 from prompts import ROUTING_PROMPT_TEMPLATE
 import argparse
 import requests
+import socket
+
+
+def get_lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
 
 class Coordinator(BaseAgent):
-    def __init__(self, name, port,api_key):
+    def __init__(self, name, port, api_key, weather_agent_host, tour_agent_host, hotel_agent_host):
         super().__init__(name, port)
         # 记录待处理任务：{trace_id: user_callback_url}
         self.api_key = api_key
+        self.lan_ip = getattr(self, "lan_ip", get_lan_ip())
         self.pending_tasks = {}
         # 串行任务状态：用于记录 tour_agent -> hotel_agent 的网络依赖
         self.pipeline_tasks = {}
-        # 子 Agent 注册表
+        # 局域网子 Agent 注册表，支持在命令行动态传入其他设备上的 Agent IP 及端口
         self.agent_registry = {
-            "weather_agent": 9010,
-            "tour_agent": 9020,
-            "hotel_agent": 9030
+            "weather_agent": weather_agent_host,
+            "tour_agent": tour_agent_host,
+            "hotel_agent": hotel_agent_host
         }
 
     def handle_task(self, data):
@@ -51,20 +66,20 @@ class Coordinator(BaseAgent):
                 self.reply_unsupported_task(task_id, user_url, instruction)
                 return 
 
-            target_port = self.agent_registry.get(target_agent_name)
+            target_host = self.agent_registry.get(target_agent_name)
 
-            if target_port:
-                # 【修改点】：使用扁平化的 A2A 格式转发给下级 Agent
+            if target_host:
+                # 使用自身的局域网真实 IP 组合成 callback_url，让远程机器能准确找到我
                 dispatch_payload = {
                     "source": self.name,
                     "target": target_agent_name,
                     "task_id": task_id,
                     "instruction": instruction,
-                    "callback_url": f"http://localhost:{self.port}" 
+                    "callback_url": self.coordinator_callback_url()
                 }
 
-                print(f"[*] 指挥官决策：任务 {task_id} 转发至 {target_agent_name} (Port: {target_port})")
-                self.send_to(target_port, dispatch_payload)
+                print(f"[*] 指挥官决策：任务 {task_id} 转发至 {target_agent_name} ({target_host})")
+                self.send_to_agent_host(target_host, dispatch_payload)
             else:
                 print("[!] 决策失败：无法匹配到合适的 Agent。")
                 self.reply_unsupported_task(task_id, user_url, instruction)
@@ -130,9 +145,31 @@ class Coordinator(BaseAgent):
         has_hotel_intent = any(keyword in instruction for keyword in hotel_keywords)
         return has_tour_intent and has_hotel_intent
 
+    def coordinator_callback_url(self):
+        return f"http://{self.lan_ip}:{self.port}"
+
+    def normalize_agent_host(self, target_host):
+        if isinstance(target_host, int) or str(target_host).isdigit():
+            return f"http://localhost:{target_host}"
+        if str(target_host).startswith("http://") or str(target_host).startswith("https://"):
+            return str(target_host)
+        return f"http://{target_host}"
+
+    def send_to_agent_host(self, target_host, payload):
+        url = self.normalize_agent_host(target_host)
+        self.log("SEND", payload)
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            if response.status_code == 200:
+                print(f"✅ 消息已成功送达至 {url}")
+            else:
+                print(f"⚠️ 消息送达至 {url}，但对方返回状态码: {response.status_code}")
+        except Exception as e:
+            print(f"❌ 无法连接到远程地址 {url}: {e}")
+
     def dispatch_to_agent(self, task_id, target_agent_name, instruction, context=None):
-        target_port = self.agent_registry.get(target_agent_name)
-        if not target_port:
+        target_host = self.agent_registry.get(target_agent_name)
+        if not target_host:
             print(f"[!] 决策失败：无法匹配到合适的 Agent: {target_agent_name}")
             return
 
@@ -141,13 +178,13 @@ class Coordinator(BaseAgent):
             "target": target_agent_name,
             "task_id": task_id,
             "instruction": instruction,
-            "callback_url": f"http://localhost:{self.port}"
+            "callback_url": self.coordinator_callback_url()
         }
         if context is not None:
             dispatch_payload["context"] = context
 
-        print(f"[*] Coordinator 派发任务 {task_id} -> {target_agent_name} (Port: {target_port})")
-        self.send_to(target_port, dispatch_payload)
+        print(f"[*] Coordinator 派发任务 {task_id} -> {target_agent_name} ({target_host})")
+        self.send_to_agent_host(target_host, dispatch_payload)
 
     def handle_pipeline_result(self, data):
         task_id = data.get("task_id")
@@ -240,7 +277,7 @@ class Coordinator(BaseAgent):
             print(f"回传给用户失败: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="运行含有 API 调用的脚本")
+    parser = argparse.ArgumentParser(description="Coordinator 局域网启动脚本")
     parser.add_argument(
         "--api_key", 
         "-k", 
@@ -248,7 +285,18 @@ if __name__ == "__main__":
         required=True, 
         help="请在此输入您的 API Key"
     )
+    parser.add_argument("--port", "-p", type=int, default=9000, help="本节点监听端口 (默认9000)")
+    parser.add_argument("--weather_agent_host", "-w", type=str, default="localhost:9010", help="天气智能体的网络地址 (例如 192.168.1.101:9010)")
+    parser.add_argument("--tour_agent_host", "-t", type=str, default="localhost:9020", help="景点/行程智能体的网络地址 (例如 192.168.1.102:9020)")
+    parser.add_argument("--hotel_agent_host", "-o", type=str, default="localhost:9030", help="酒店智能体的网络地址 (例如 192.168.1.103:9030)")
     args = parser.parse_args()
-    api_key = args.api_key
-    coord = Coordinator("Coordinator", 9000, api_key)
+
+    coord = Coordinator(
+        "Coordinator",
+        args.port,
+        args.api_key,
+        args.weather_agent_host,
+        args.tour_agent_host,
+        args.hotel_agent_host
+    )
     coord.start()
