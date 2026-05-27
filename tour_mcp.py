@@ -30,11 +30,8 @@ class TourMcp:
             print(f"[*] 收到查询请求：正在查询 {city} 的景点...")
             
             # 💡 这里写死模拟数据，真实业务中这里会使用 requests 调用景点 API
-            mock_result = [
-                {"name": "景点1", "description": "描述1"},
-                {"name": "景点2", "description": "描述2"},
-                {"name": "景点3", "description": "描述3"}
-            ]
+            # 为了方便酒店 Agent 依赖景点结果，额外补充 area / suggested_time / tags 字段。
+            mock_result = self.get_mock_attractions(city)
             
             # 3. 构造标准的 JSON-RPC 响应
             return {
@@ -49,6 +46,32 @@ class TourMcp:
                 "error": {"code": -32601, "message": f"Method '{method}' not found"},
                 "id": req_id
             }
+
+    def get_mock_attractions(self, city):
+        city_profiles = {
+            "上海": [
+                {"name": "外滩", "description": "上海经典城市天际线观景地。", "area": "黄浦区", "suggested_time": "晚上", "tags": ["夜景", "地标"]},
+                {"name": "南京东路步行街", "description": "靠近外滩的商业步行街。", "area": "黄浦区", "suggested_time": "下午", "tags": ["购物", "交通便利"]},
+                {"name": "上海博物馆", "description": "人民广场附近的综合性博物馆。", "area": "人民广场", "suggested_time": "上午", "tags": ["文化", "室内"]},
+                {"name": "陆家嘴", "description": "浦东核心商务区和观景区域。", "area": "浦东新区", "suggested_time": "傍晚", "tags": ["地标", "观景"]}
+            ],
+            "北京": [
+                {"name": "故宫博物院", "description": "北京代表性历史文化景点。", "area": "东城区", "suggested_time": "上午", "tags": ["历史", "文化"]},
+                {"name": "天安门广场", "description": "可与故宫串联游览的核心地标。", "area": "东城区", "suggested_time": "上午", "tags": ["地标", "历史"]},
+                {"name": "颐和园", "description": "湖景和园林结合的经典景点。", "area": "海淀区", "suggested_time": "下午", "tags": ["园林", "慢游"]}
+            ],
+            "广州": [
+                {"name": "广州塔", "description": "广州城市地标，适合夜间观景。", "area": "海珠区", "suggested_time": "晚上", "tags": ["地标", "夜景"]},
+                {"name": "沙面岛", "description": "具有历史建筑风貌的慢游街区。", "area": "荔湾区", "suggested_time": "下午", "tags": ["街区", "建筑"]},
+                {"name": "陈家祠", "description": "岭南建筑与民俗艺术代表景点。", "area": "荔湾区", "suggested_time": "上午", "tags": ["文化", "建筑"]}
+            ]
+        }
+
+        return city_profiles.get(city, [
+            {"name": f"{city}城市中心景点", "description": f"{city}市区内交通便利的经典景点。", "area": "市中心", "suggested_time": "上午", "tags": ["经典", "交通便利"]},
+            {"name": f"{city}特色街区", "description": f"适合体验{city}本地生活和餐饮的街区。", "area": "核心商圈", "suggested_time": "下午", "tags": ["街区", "餐饮"]},
+            {"name": f"{city}夜景观赏点", "description": f"适合晚上安排的{city}城市景观地点。", "area": "景观区", "suggested_time": "晚上", "tags": ["夜景", "休闲"]}
+        ])
 
     def start(self):
         server_address = ('', self.port)
