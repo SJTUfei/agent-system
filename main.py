@@ -10,7 +10,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
 
-def build_services(api_key, include_weather, no_user):
+def build_services(api_key, no_weather, no_user):
     services = [
         ("tour_mcp", [sys.executable, "tour_mcp.py"], 8002),
         ("hotel_mcp", [sys.executable, "hotel_mcp.py"], 8003),
@@ -19,7 +19,7 @@ def build_services(api_key, include_weather, no_user):
         ("hotel_agent", [sys.executable, "hotel_agent.py", "--api_key", api_key], 9030),
     ]
 
-    if include_weather:
+    if not no_weather:
         services.insert(0, ("weather_mcp", [sys.executable, "weather_mcp.py"], 8001))
         services.insert(3, ("weather_agent", [sys.executable, "weather_agent.py", "--api_key", api_key], 9010))
 
@@ -82,7 +82,12 @@ def parse_args():
     parser.add_argument(
         "--include-weather",
         action="store_true",
-        help="同时启动原有天气 Agent 和天气 MCP。默认不启动。"
+        help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--no-weather",
+        action="store_true",
+        help="Do not start weather Agent or weather MCP."
     )
     parser.add_argument(
         "--no-user",
@@ -111,7 +116,7 @@ def main():
         return 2
 
     new_window = os.name == "nt" and not args.same_window
-    services = build_services(args.api_key, args.include_weather, args.no_user)
+    services = build_services(args.api_key, args.no_weather, args.no_user)
     processes = []
 
     print("[MAIN] 即将启动旅行社多 Agent 演示系统")
